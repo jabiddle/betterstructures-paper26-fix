@@ -25,14 +25,16 @@ import org.bukkit.plugin.java.JavaPlugin;
  * chunk is loaded; if not, it requests it with getChunkAtAsync and checks isLoaded() on a later tick. Paper
  * 26.3 unloads that chunk before the check, so the request repeats forever and every later paste waits.
  *
- * Fix: while a paste operation is active, keep plugin tickets on every chunk of its footprint (corner plus
- * schematic size). Tickets load chunks asynchronously and are never added in response to chunk loads, so
- * there is no cascade. They are released a few seconds after the operation finishes. As a fallback for
- * operations whose footprint can't be read, the pending chunk request is ticketed when it completes.
+ * Fix: while a paste operation is active, keep plugin tickets on every chunk of its footprint (single
+ * schematic corner + size, or all module inputs of a ModularPaste dungeon). Tickets load chunks
+ * asynchronously and are never added in response to chunk loads, so there is no cascade. They are released
+ * a few seconds after the operation finishes. As a fallback for operations whose footprint can't be read,
+ * the pending chunk request (and nextLocation if present) is ticketed via World#addPluginChunkTicket even
+ * if the chunk already unloaded before the callback ran.
  */
 public final class BSPasteKeeper extends JavaPlugin {
     private static final long RELEASE_DELAY_TICKS = 100L;
-    private static final int MAX_FOOTPRINT_CHUNKS = 64;
+    private static final int MAX_FOOTPRINT_CHUNKS = 512;
 
     private record Key(World world, int x, int z) { }
 
@@ -83,6 +85,7 @@ public final class BSPasteKeeper extends JavaPlugin {
                 if (operation != null) operations++;
             } else if (operation != null) {
                 stalledTicks++;
+                if (footprint.isEmpty()) setFootprint(footprintOf(operation));
             }
             if (operation != null) hookPending(operation);
         } catch (Throwable t) {
@@ -107,37 +110,68 @@ public final class BSPasteKeeper extends JavaPlugin {
         if (!next.isEmpty()) footprintOps++;
     }
 
-    /** Chunks covered by the operation's corner + clipboard dimensions, or empty if unknown. */
+    /** Chunks covered by the operation's corner + clipboard dimensions or modular inputs, or empty if unknown. */
     private Set<Key> footprintOf(Object operation) throws Exception {
-        Location corner = null;
-        Object clipboard = null;
+        Set<Key> keys = new HashSet<>();
         Field adjusted = findField(operation.getClass(), "adjustedLocation");
         Field clip = findField(operation.getClass(), "clipboard");
         if (adjusted != null && clip != null) {
-            corner = (Location) adjusted.get(operation);
-            clipboard = clip.get(operation);
-        } else {
-            Field c = findField(operation.getClass(), "corner");
-            Field outer = findField(operation.getClass(), "this$0");
-            if (c != null && outer != null) {
-                corner = (Location) c.get(operation);
-                clipboard = schematicClipboard.get(outer.get(operation));
+            addBox(keys, (Location) adjusted.get(operation), clip.get(operation), 0);
+            return keys;
+        }
+        Field c = findField(operation.getClass(), "corner");
+        Field outer = findField(operation.getClass(), "this$0");
+        if (c != null && outer != null) {
+            Object outerObj = outer.get(operation);
+            if (outerObj != null && schematicClipboard.getDeclaringClass().isInstance(outerObj)) {
+                addBox(keys, (Location) c.get(operation), schematicClipboard.get(outerObj), 0);
+                Field baseF = findField(operation.getClass(), "base");
+                if (baseF != null && baseF.get(operation) instanceof Location base && base.getWorld() != null) {
+                    keys.add(new Key(base.getWorld(), base.getBlockX() >> 4, base.getBlockZ() >> 4));
+                }
+                return keys;
             }
         }
-        if (corner == null || clipboard == null || corner.getWorld() == null) return Set.of();
-        Object dims = clipboard.getClass().getMethod("getDimensions").invoke(clipboard);
-        Method mx = dims.getClass().getMethod("x"), mz = dims.getClass().getMethod("z");
-        int width = (int) mx.invoke(dims), depth = (int) mz.invoke(dims);
-        int minX = corner.getBlockX() >> 4, maxX = (corner.getBlockX() + Math.max(width, 1) - 1) >> 4;
-        int minZ = corner.getBlockZ() >> 4, maxZ = (corner.getBlockZ() + Math.max(depth, 1) - 1) >> 4;
-        if ((long) (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_FOOTPRINT_CHUNKS) return Set.of();
-        Set<Key> keys = new HashSet<>();
-        for (int x = minX; x <= maxX; x++) for (int z = minZ; z <= maxZ; z++) keys.add(new Key(corner.getWorld(), x, z));
-        return keys;
+        Field inputsField = findField(operation.getClass(), "inputs");
+        if (inputsField != null && inputsField.get(operation) instanceof Collection<?> inputs) {
+            for (Object in : inputs) {
+                if (in == null) continue;
+                Field locF = findField(in.getClass(), "location");
+                Field clipF = findField(in.getClass(), "clipboard");
+                Field rotF = findField(in.getClass(), "rotation");
+                if (locF == null || clipF == null) continue;
+                int rot = rotF != null ? (int) rotF.get(in) : 0;
+                addBox(keys, (Location) locF.get(in), clipF.get(in), rot);
+                if (keys.size() > MAX_FOOTPRINT_CHUNKS) return Set.of();
+            }
+            return keys;
+        }
+        return Set.of();
     }
 
-    /** Fallback: ticket the chunk BetterStructures is waiting for as soon as it loads. */
+    private static void addBox(Set<Key> keys, Location corner, Object clipboard, int rotation) throws Exception {
+        if (corner == null || clipboard == null || corner.getWorld() == null) return;
+        Object dims = accessible(clipboard.getClass().getMethod("getDimensions")).invoke(clipboard);
+        Method mx = accessible(dims.getClass().getMethod("x")), mz = accessible(dims.getClass().getMethod("z"));
+        int dx = (int) mx.invoke(dims), dz = (int) mz.invoke(dims);
+        int width = Math.floorMod(rotation, 180) == 0 ? dx : dz;
+        int depth = Math.floorMod(rotation, 180) == 0 ? dz : dx;
+        int minX = corner.getBlockX() >> 4, maxX = (corner.getBlockX() + Math.max(width, 1) - 1) >> 4;
+        int minZ = corner.getBlockZ() >> 4, maxZ = (corner.getBlockZ() + Math.max(depth, 1) - 1) >> 4;
+        if ((long) (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_FOOTPRINT_CHUNKS) return;
+        for (int x = minX; x <= maxX; x++) {
+            for (int z = minZ; z <= maxZ; z++) {
+                keys.add(new Key(corner.getWorld(), x, z));
+            }
+        }
+    }
+
+    /** Fallback: ticket the chunk BetterStructures is waiting for even if it unloaded before the next tick. */
     private void hookPending(Object operation) throws IllegalAccessException {
+        Field nextLocField = findField(operation.getClass(), "nextLocation");
+        if (nextLocField != null && nextLocField.get(operation) instanceof Location loc && loc.getWorld() != null) {
+            keepChunk(new Key(loc.getWorld(), loc.getBlockX() >> 4, loc.getBlockZ() >> 4));
+        }
         Field chunksField = findField(operation.getClass(), "chunks");
         if (chunksField == null) return;
         Object readiness = chunksField.get(operation);
@@ -147,21 +181,24 @@ public final class BSPasteKeeper extends JavaPlugin {
         future.thenAccept(result -> {
             if (result instanceof Chunk chunk) {
                 Runnable keep = () -> {
-                    if (!isEnabled() || !chunk.isLoaded()) return;
-                    Key k = new Key(chunk.getWorld(), chunk.getX(), chunk.getZ());
-                    Long prev = releaseAt.get(k);
-                    if (prev == null) {
-                        chunk.addPluginChunkTicket(this);
-                        releaseAt.put(k, tick + RELEASE_DELAY_TICKS);
-                        fallbackKeeps++;
-                    } else if (prev != Long.MAX_VALUE) {
-                        releaseAt.put(k, tick + RELEASE_DELAY_TICKS);
-                    }
+                    if (!isEnabled()) return;
+                    keepChunk(new Key(chunk.getWorld(), chunk.getX(), chunk.getZ()));
                 };
                 if (Bukkit.isPrimaryThread()) keep.run();
                 else Bukkit.getScheduler().runTask(this, keep);
             }
         });
+    }
+
+    private void keepChunk(Key k) {
+        Long prev = releaseAt.get(k);
+        if (prev == null) {
+            k.world().addPluginChunkTicket(k.x(), k.z(), this);
+            releaseAt.put(k, tick + RELEASE_DELAY_TICKS);
+            fallbackKeeps++;
+        } else if (prev != Long.MAX_VALUE) {
+            releaseAt.put(k, tick + RELEASE_DELAY_TICKS);
+        }
     }
 
     private void report() {
@@ -178,6 +215,11 @@ public final class BSPasteKeeper extends JavaPlugin {
     private static Field accessible(Field f) {
         f.setAccessible(true);
         return f;
+    }
+
+    private static Method accessible(Method m) {
+        m.setAccessible(true);
+        return m;
     }
 
     private static Field findField(Class<?> type, String name) {

@@ -72,7 +72,7 @@ The wedged chunk never finishes lighting, so Paper sends neither it nor its neig
 ### Install
 
 1. Put `BSPasteKeeper/BSPasteKeeper-1.0.0.jar` in `plugins/`. It depends on BetterStructures.
-   - SHA-256: `ea54844d7e4d969abfdc94c16901834148453c12bb5a76381ac9cbb5c7576fa2`
+   - SHA-256: `83e17e5924b82979fc69b15d4160ae4c4aefb80fc09db50188d6bec0deba2aff`
 2. If you pregenerate with Chunky, add the JVM flag `-Dchunky.tickingLoadDuration=10` to your server start command. It makes Chunky hold each chunk for 10 s, so BetterStructures' deferred scan can still reach it (issue 2).
 3. Recommended, against issue 3:
    - Set `chunks.prevent-moving-into-unloaded-chunks: true` in `config/paper-world-defaults.yml`.
@@ -85,12 +85,16 @@ Chunks generated *before* installing the fix keep their missing structures. Bett
 
 `BSPasteKeeper` (source in `BSPasteKeeper/src`) is a standalone plugin and changes no BetterStructures code.
 - Every tick it reads `Schematic.activePasteOperation` through reflection.
-- It computes the operation's footprint: `adjustedLocation` + `clipboard` for `ClipboardPasteOperation`, or `corner` + `FitAnything.schematicClipboard` (via `this$0`) for `Preparation` and `Finishing`. It holds plugin tickets on those chunks (up to 64) and releases them 5 s after the operation changes.
+- It computes the operation's footprint across all four `PasteOperation` implementations:
+  - `adjustedLocation` + `clipboard` for `Schematic$ClipboardPasteOperation`
+  - `corner` + `FitAnything.schematicClipboard` (via `this$0`) for `FitAnything$Preparation` and `FitAnything$Finishing`
+  - `inputs` (`Collection<ModuleInput>`, reading each module's `location`, `clipboard`, and `rotation`) for `ModulePasting$ModularPaste` (WFC modular dungeons)
+  It holds plugin tickets on those chunks (up to 512 chunks to cover multi-module dungeons) and releases them 5 s after the operation changes.
 - Tickets load chunks asynchronously, so `PasteChunkReadiness` always finds its chunk loaded.
-- Fallback: if an operation's footprint can't be read, it tickets the chunk from the pending `getChunkAtAsync` future when that completes.
+- Fallback: if an operation's footprint can't be read, it tickets `nextLocation` directly and hooks `chunks.pending` (`getChunkAtAsync`) to call `World#addPluginChunkTicket(x, z, plugin)` unconditionally when completed (even if Paper already unloaded the chunk before the next tick).
 - It never adds tickets in response to `ChunkLoadEvent`. Doing that cascades through neighbour-chunk loads.
 - If the BetterStructures internals it reads don't exist (for example after an update), it logs a warning and disables itself.
-- Every minute it logs `pastes started`, `pinned`, `queued` and `activeFor`. A healthy server shows `queued=0`.
+- Every minute it logs `pastes started`, `pinned`, `queued` and `activeFor`. A healthy server shows `queued=0` (or rapidly draining after a large batch of modular dungeons).
 
 ### Results
 
