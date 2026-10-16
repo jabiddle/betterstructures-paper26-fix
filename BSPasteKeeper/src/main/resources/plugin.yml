@@ -1,0 +1,6 @@
+name: BSPasteKeeper
+version: 1.0.0
+main: keeper.BSPasteKeeper
+api-version: '1.21'
+depend: [BetterStructures]
+description: Keeps BetterStructures paste chunks loaded on Paper 26.3 so its paste queue cannot stall.

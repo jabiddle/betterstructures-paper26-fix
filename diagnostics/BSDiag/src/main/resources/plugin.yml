@@ -1,0 +1,6 @@
+name: BSDiag
+version: 1.0.0
+main: diag.BSDiag
+api-version: '1.21'
+softdepend: [BetterStructures]
+description: Temporary read-only diagnostics for BetterStructures chunk scanning.
